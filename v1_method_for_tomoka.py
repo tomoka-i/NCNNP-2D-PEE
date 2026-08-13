@@ -118,6 +118,56 @@ def get_full_complexity_matrix(img_arr):
     var = (l_sq_sum / n) - (mean**2)
     return np.sqrt(np.maximum(var, 0))
 
+
+def get_cross_complexity_matrix(img_arr, target_parity):
+    """
+    Compute complexity for one checkerboard target set from the opposite set.
+
+    Every offset has odd checkerboard parity, so each valid neighbour is in the
+    opposite checkerboard set.  Unlike the legacy full-image implementation,
+    out-of-image neighbours are omitted instead of edge-padded: edge padding
+    can copy a target pixel at the border and break blind reproducibility.
+    """
+    if target_parity not in (0, 1):
+        raise ValueError(f"target_parity must be 0 or 1, got {target_parity}")
+
+    img = img_arr.astype(np.float32)
+    h, w = img.shape
+    y_idx, x_idx = np.indices((h, w))
+    target_mask = (y_idx + x_idx) % 2 == target_parity
+    value_sum = np.zeros_like(img)
+    squared_sum = np.zeros_like(img)
+    neighbour_count = np.zeros_like(img)
+    offsets = [
+        (-2, -1), (-2, 1), (-1, -2), (-1, 0), (-1, 2),
+        (0, -1), (0, 1), (1, -2), (1, 0), (1, 2),
+        (2, -1), (2, 1)
+    ]
+
+    for dy, dx in offsets:
+        target_y_start, target_y_end = max(0, -dy), min(h, h - dy)
+        target_x_start, target_x_end = max(0, -dx), min(w, w - dx)
+        source_y_start, source_y_end = target_y_start + dy, target_y_end + dy
+        source_x_start, source_x_end = target_x_start + dx, target_x_end + dx
+
+        target_slice = np.s_[target_y_start:target_y_end, target_x_start:target_x_end]
+        source_values = img[source_y_start:source_y_end, source_x_start:source_x_end]
+        target_values = target_mask[target_slice]
+        value_sum[target_slice] += source_values * target_values
+        squared_sum[target_slice] += source_values ** 2 * target_values
+        neighbour_count[target_slice] += target_values
+
+    complexity = np.full(img.shape, np.nan, dtype=np.float32)
+    valid_target = target_mask & (neighbour_count > 0)
+    mean = np.zeros_like(img)
+    mean[valid_target] = value_sum[valid_target] / neighbour_count[valid_target]
+    variance = np.zeros_like(img)
+    variance[valid_target] = (
+        squared_sum[valid_target] / neighbour_count[valid_target]
+    ) - mean[valid_target] ** 2
+    complexity[valid_target] = np.sqrt(np.maximum(variance[valid_target], 0))
+    return complexity
+
 # ============================================================
 # 2. 單軸 1D T=1 規則 (論文 Eq.2, 對 T=1 的特例)
 # ============================================================
@@ -316,7 +366,7 @@ def get_pair_priority_order(pair_coords, comp_matrix):
 def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix,
                        bit_ptr_start=0, target_ec=None):
     """
-    comp_matrix: 每個pixel的局部複雜度 (get_full_complexity_matrix算出來的)，
+    comp_matrix: target parity用的局部複雜度 (get_cross_complexity_matrix算出來的)，
     數值越小代表越平滑、預測越準。pair的複雜度取兩個pixel複雜度的平均，
     embedding依複雜度由小到大優先處理，達到target_ec就停止，
     複雜度高的區域完全不碰(不shift、不嵌入)。
@@ -460,36 +510,104 @@ def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix, sto
 # ============================================================
 # 7. 兩階段 (checkerboard) 整合
 # ============================================================
-def try_embedding_2d(model, img_arr, full_payload, device, target_ec, comp_matrix):
-    h, w = img_arr.shape
+def predict_target_parity(model, img_arr, target_parity, device):
+    """Predict target_parity pixels using only the opposite checkerboard set."""
     to_tensor = transforms.ToTensor()
+    h, w = img_arr.shape
     y_idx, x_idx = np.indices((h, w))
 
-    m1_in = img_arr.copy()
-    m1_in[(y_idx + x_idx) % 2 != 0] = 0
+    model_input = img_arr.copy()
+    model_input[(y_idx + x_idx) % 2 == target_parity] = 0
     with torch.no_grad():
-        p1_raw = model(to_tensor(Image.fromarray(m1_in)).unsqueeze(0).to(device))[0, 0] * 255
-        p1_rounded = np.round(torch.clamp(p1_raw, 0, 255).cpu().numpy()).astype(np.int32)
+        prediction_raw = model(
+            to_tensor(Image.fromarray(model_input)).unsqueeze(0).to(device)
+        )[0, 0] * 255
+    return np.round(
+        torch.clamp(prediction_raw, 0, 255).cpu().numpy()
+    ).astype(np.int32)
 
-    stego1, used1, _ = embed_stage_2dpee(
-        img_arr, p1_rounded, 1, full_payload, comp_matrix, bit_ptr_start=0, target_ec=target_ec)
-    s1_arr = np.array(stego1)
 
-    m2_in = s1_arr.copy()
-    m2_in[(y_idx + x_idx) % 2 != 1] = 0
-    with torch.no_grad():
-        p2_raw = model(to_tensor(Image.fromarray(m2_in)).unsqueeze(0).to(device))[0, 0] * 255
-        p2_rounded = np.round(torch.clamp(p2_raw, 0, 255).cpu().numpy()).astype(np.int32)
+def embed_two_stage_2dpee(model, img_arr, full_payload, device, target_ec):
+    """
+    Embed payload in checkerboard order with decoder-reproducible complexity.
 
-    stego2, used_total, _ = embed_stage_2dpee(
-        s1_arr, p2_rounded, 0, full_payload, comp_matrix, bit_ptr_start=used1, target_ec=target_ec)
+    Stage 1 embeds parity-1 pixels using complexity from original parity-0
+    pixels.  Stage 2 embeds parity-0 pixels using complexity from the parity-1
+    stego pixels produced by Stage 1.
+    """
+    stage1_target = 1
+    stage2_target = 0
+
+    prediction1 = predict_target_parity(model, img_arr, stage1_target, device)
+    complexity1 = get_cross_complexity_matrix(img_arr, stage1_target)
+    stego1, used1, stop_rank1 = embed_stage_2dpee(
+        img_arr, prediction1, stage1_target, full_payload, complexity1,
+        bit_ptr_start=0, target_ec=target_ec)
+    stego1_arr = np.array(stego1)
+
+    prediction2 = predict_target_parity(model, stego1_arr, stage2_target, device)
+    complexity2 = get_cross_complexity_matrix(stego1_arr, stage2_target)
+    stego2, used_total, stop_rank2 = embed_stage_2dpee(
+        stego1_arr, prediction2, stage2_target, full_payload, complexity2,
+        bit_ptr_start=used1, target_ec=target_ec)
+
+    embedding_info = {
+        "payload_length": used_total,
+        "stage1_payload_length": used1,
+        "stage1_stop_rank": stop_rank1,
+        "stage2_stop_rank": stop_rank2,
+    }
+    return stego2, embedding_info
+
+
+def extract_two_stage_2dpee(model, stego_arr, device, stage1_stop_rank,
+                             stage2_stop_rank, payload_length=None):
+    """
+    Recover the payload and cover image in the reverse checkerboard order.
+
+    Stage 2 is decoded first.  Its complexity is computed from the parity-1
+    stego pixels, which are unchanged by Stage 2 and match the encoder input.
+    After restoring Stage 2, Stage 1 is decoded using the restored parity-0
+    pixels.  This reproduces both complexity orders without the cover image.
+    """
+    stage1_target = 1
+    stage2_target = 0
+    stego_arr = np.asarray(stego_arr)
+
+    prediction2 = predict_target_parity(model, stego_arr, stage2_target, device)
+    complexity2 = get_cross_complexity_matrix(stego_arr, stage2_target)
+    stego1, stage2_bits = extract_stage_2dpee(
+        stego_arr, prediction2, stage2_target, complexity2, stage2_stop_rank)
+    stego1_arr = np.array(stego1)
+
+    prediction1 = predict_target_parity(model, stego1_arr, stage1_target, device)
+    complexity1 = get_cross_complexity_matrix(stego1_arr, stage1_target)
+    recovered, stage1_bits = extract_stage_2dpee(
+        stego1_arr, prediction1, stage1_target, complexity1, stage1_stop_rank)
+
+    extracted_payload = stage1_bits + stage2_bits
+    if payload_length is not None:
+        if payload_length < 0:
+            raise ValueError(f"payload_length must be non-negative, got {payload_length}")
+        if payload_length > len(extracted_payload):
+            raise ValueError(
+                "payload_length exceeds the number of extracted bits: "
+                f"{payload_length} > {len(extracted_payload)}")
+        extracted_payload = extracted_payload[:payload_length]
+
+    return recovered, extracted_payload
+
+
+def try_embedding_2d(model, img_arr, full_payload, device, target_ec):
+    stego2, embedding_info = embed_two_stage_2dpee(
+        model, img_arr, full_payload, device, target_ec)
 
     stego_arr = np.array(stego2)
     mse = np.mean((img_arr.astype(np.float32) - stego_arr.astype(np.float32)) ** 2)
     psnr_val = 10 * log10(255 ** 2 / mse) if mse > 0 else 100
     ssim_val = ssim(img_arr, stego_arr, data_range=255)
 
-    return used_total, psnr_val, ssim_val, stego2
+    return embedding_info["payload_length"], psnr_val, ssim_val, stego2
 
 
 # ============================================================
@@ -516,14 +634,12 @@ def main():
         if not file_name.lower().endswith(".bmp"):
             continue
         img_arr = np.array(Image.open(os.path.join(img_dir, file_name)).convert("L"))
-        comp_matrix = get_full_complexity_matrix(img_arr)
-
         for ec in EC_LIST:
             payload = [np.random.randint(0, 2) for _ in range(ec)]
 
             print(f"\n[Processing] {file_name} | EC target: {ec}")
             used, psnr, ssim_val, stego = try_embedding_2d(
-                model, img_arr, payload, device, target_ec=ec, comp_matrix=comp_matrix)
+                model, img_arr, payload, device, target_ec=ec)
 
             status = "SUCCESS" if used >= ec else "PARTIAL"
             print(f"  Used: {used}/{ec} bits | PSNR: {psnr:.2f} | SSIM: {ssim_val:.4f} | {status}")
