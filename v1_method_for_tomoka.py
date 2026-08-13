@@ -14,6 +14,8 @@ IEEE TIP, Fig.3 (T=1, proposed pairwise PEE) 精確實作
 
 import os
 import csv
+import struct
+import zlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -123,6 +125,11 @@ LOCATION_MAP_UNCHANGED = 0
 LOCATION_MAP_FROM_ZERO = 1
 LOCATION_MAP_FROM_255 = 2
 
+AUXILIARY_MAGIC = b"RDP4"
+AUXILIARY_VERSION = 1
+AUXILIARY_HEADER_FORMAT = ">4sBIIIIII"
+AUXILIARY_HEADER_SIZE = struct.calcsize(AUXILIARY_HEADER_FORMAT)
+
 
 def preprocess_boundary_pixels(img_arr):
     """
@@ -169,6 +176,188 @@ def restore_boundary_pixels(img_arr, location_map):
     restored[location_map == LOCATION_MAP_FROM_ZERO] = 0
     restored[location_map == LOCATION_MAP_FROM_255] = 255
     return restored
+
+
+def pack_location_map(location_map):
+    """Pack 3-symbol location-map values into 2-bit symbols and compress them."""
+    location_map = np.asarray(location_map)
+    if location_map.ndim != 2:
+        raise ValueError("location_map must be a 2D array")
+    if np.any(~np.isin(
+        location_map,
+        (LOCATION_MAP_UNCHANGED, LOCATION_MAP_FROM_ZERO, LOCATION_MAP_FROM_255),
+    )):
+        raise ValueError("location_map contains an unknown symbol")
+
+    flat = location_map.astype(np.uint8, copy=False).ravel()
+    packed = np.zeros((len(flat) + 3) // 4, dtype=np.uint8)
+    for index, symbol in enumerate(flat):
+        packed[index // 4] |= int(symbol) << (6 - 2 * (index % 4))
+    return zlib.compress(packed.tobytes())
+
+
+def unpack_location_map(compressed_map, shape):
+    """Decompress and unpack a location map serialized by pack_location_map."""
+    if len(shape) != 2:
+        raise ValueError(f"shape must have two dimensions, got {shape}")
+    h, w = shape
+    expected_pixels = h * w
+    expected_bytes = (expected_pixels + 3) // 4
+    try:
+        packed = zlib.decompress(compressed_map)
+    except zlib.error as error:
+        raise ValueError("location map decompression failed") from error
+    if len(packed) != expected_bytes:
+        raise ValueError(
+            "location map byte length does not match image shape: "
+            f"{len(packed)} != {expected_bytes}")
+
+    values = np.empty(expected_pixels, dtype=np.uint8)
+    for index in range(expected_pixels):
+        values[index] = (packed[index // 4] >> (6 - 2 * (index % 4))) & 0b11
+    if np.any(values == 3):
+        raise ValueError("location map contains reserved symbol 3")
+    return values.reshape(shape)
+
+
+def bytes_to_bits(data):
+    """Convert bytes to bits in MSB-first order for LSB payload storage."""
+    return [
+        (byte >> shift) & 1
+        for byte in data
+        for shift in range(7, -1, -1)
+    ]
+
+
+def bits_to_bytes(bits):
+    """Convert an MSB-first bit sequence to bytes."""
+    if len(bits) % 8 != 0:
+        raise ValueError("bit length must be a multiple of 8")
+    return bytes(
+        sum(int(bits[index + offset]) << (7 - offset) for offset in range(8))
+        for index in range(0, len(bits), 8)
+    )
+
+
+def get_auxiliary_lsb_coordinates(shape):
+    """Return image-border coordinates in a deterministic, non-duplicated order."""
+    if len(shape) != 2:
+        raise ValueError(f"shape must have two dimensions, got {shape}")
+    h, w = shape
+    if h < 1 or w < 1:
+        raise ValueError(f"image shape must be positive, got {shape}")
+
+    coords = [(0, x) for x in range(w)]
+    if h > 1:
+        coords.extend((h - 1, x) for x in range(w))
+    for y in range(1, h - 1):
+        coords.append((y, 0))
+        if w > 1:
+            coords.append((y, w - 1))
+    return coords
+
+
+def get_reserved_lsb_mask(shape, required_bits):
+    """Reserve the first required_bits image-border pixels for auxiliary LSBs."""
+    if required_bits < 0:
+        raise ValueError(f"required_bits must be non-negative, got {required_bits}")
+    candidates = get_auxiliary_lsb_coordinates(shape)
+    if required_bits > len(candidates):
+        raise ValueError(
+            "auxiliary information exceeds border-LSB capacity: "
+            f"requires {required_bits} bits, capacity is {len(candidates)} bits")
+
+    reserved_mask = np.zeros(shape, dtype=bool)
+    for y, x in candidates[:required_bits]:
+        reserved_mask[y, x] = True
+    return candidates[:required_bits], reserved_mask
+
+
+def clear_reserved_lsb(img_arr, reserved_mask):
+    """Use a deterministic reserved-pixel context for encoder and decoder."""
+    image = np.asarray(img_arr)
+    if image.shape != reserved_mask.shape:
+        raise ValueError("img_arr and reserved_mask must have the same shape")
+    context = image.astype(np.uint8, copy=True)
+    context[reserved_mask] &= 0b11111110
+    return context
+
+
+def read_lsb_bits(img_arr, coords):
+    image = np.asarray(img_arr)
+    return [int(image[y, x]) & 1 for y, x in coords]
+
+
+def write_lsb_bits(img_arr, coords, bits):
+    if len(coords) != len(bits):
+        raise ValueError("coords and bits must have the same length")
+    result = np.asarray(img_arr).astype(np.uint8, copy=True)
+    for (y, x), bit in zip(coords, bits):
+        if bit not in (0, 1):
+            raise ValueError(f"LSB payload must contain only 0 or 1, got {bit}")
+        result[y, x] = (result[y, x] & 0b11111110) | int(bit)
+    return result
+
+
+def serialize_auxiliary_information(shape, stage1_stop_rank, stage2_stop_rank,
+                                    payload_length, compressed_location_map):
+    """Serialize fixed-size header fields followed by compressed location-map data."""
+    if len(shape) != 2:
+        raise ValueError(f"shape must have two dimensions, got {shape}")
+    values = (
+        shape[0],
+        shape[1],
+        stage1_stop_rank,
+        stage2_stop_rank,
+        payload_length,
+        len(compressed_location_map),
+    )
+    if any(not 0 <= value <= 0xFFFFFFFF for value in values):
+        raise ValueError("auxiliary header values must fit in an unsigned 32-bit integer")
+    header = struct.pack(
+        AUXILIARY_HEADER_FORMAT,
+        AUXILIARY_MAGIC,
+        AUXILIARY_VERSION,
+        *values,
+    )
+    return header + compressed_location_map
+
+
+def deserialize_auxiliary_information(stego_arr):
+    """Read header and compressed location map from deterministic border LSBs."""
+    stego_arr = np.asarray(stego_arr)
+    candidates = get_auxiliary_lsb_coordinates(stego_arr.shape)
+    header_bit_count = AUXILIARY_HEADER_SIZE * 8
+    if len(candidates) < header_bit_count:
+        raise ValueError(
+            "image border is too small to hold the auxiliary-information header")
+
+    header = bits_to_bytes(read_lsb_bits(stego_arr, candidates[:header_bit_count]))
+    try:
+        magic, version, h, w, stop1, stop2, payload_length, map_length = struct.unpack(
+            AUXILIARY_HEADER_FORMAT, header)
+    except struct.error as error:
+        raise ValueError("auxiliary-information header is malformed") from error
+    if magic != AUXILIARY_MAGIC or version != AUXILIARY_VERSION:
+        raise ValueError("auxiliary-information header is missing or unsupported")
+    if (h, w) != stego_arr.shape:
+        raise ValueError(
+            "auxiliary-information image shape does not match stego image: "
+            f"{(h, w)} != {stego_arr.shape}")
+
+    total_bit_count = (AUXILIARY_HEADER_SIZE + map_length) * 8
+    coords, _ = get_reserved_lsb_mask(stego_arr.shape, total_bit_count)
+    auxiliary_bytes = bits_to_bytes(read_lsb_bits(stego_arr, coords))
+    compressed_location_map = auxiliary_bytes[AUXILIARY_HEADER_SIZE:]
+    location_map = unpack_location_map(compressed_location_map, (h, w))
+    return {
+        "stage1_stop_rank": stop1,
+        "stage2_stop_rank": stop2,
+        "payload_length": payload_length,
+        "location_map": location_map,
+        "auxiliary_bit_length": total_bit_count,
+        "reserved_coords": coords,
+    }
 
 
 def assign_predicted_pixel(res, rounded_pred, coord, error):
@@ -388,11 +577,16 @@ def ternary_capacity_bits(n_A):
 # ============================================================
 # 5. valid pixel 取得 / pairing (跟之前相同)
 # ============================================================
-def get_valid_errors_in_order(img_arr, rounded_pred, target_parity):
+def get_valid_errors_in_order(img_arr, rounded_pred, target_parity,
+                              reserved_mask=None):
     h, w = img_arr.shape
     error_map = img_arr.astype(np.int32) - rounded_pred
     y_idx, x_idx = np.indices((h, w))
     valid_mask = (y_idx + x_idx) % 2 == target_parity
+    if reserved_mask is not None:
+        if reserved_mask.shape != img_arr.shape:
+            raise ValueError("reserved_mask and img_arr must have the same shape")
+        valid_mask &= ~reserved_mask
     coords = np.argwhere(valid_mask)
     errors = error_map[valid_mask]
     return coords, errors, valid_mask
@@ -427,14 +621,15 @@ def get_pair_priority_order(pair_coords, comp_matrix):
 # 6. Stage-level embed / extract
 # ============================================================
 def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix,
-                       bit_ptr_start=0, target_ec=None):
+                       bit_ptr_start=0, target_ec=None, reserved_mask=None):
     """
     comp_matrix: target parity用的局部複雜度 (get_cross_complexity_matrix算出來的)，
     數值越小代表越平滑、預測越準。pair的複雜度取兩個pixel複雜度的平均，
     embedding依複雜度由小到大優先處理，達到target_ec就停止，
     複雜度高的區域完全不碰(不shift、不嵌入)。
     """
-    coords, errors, _ = get_valid_errors_in_order(img_arr, rounded_pred, target_parity)
+    coords, errors, _ = get_valid_errors_in_order(
+        img_arr, rounded_pred, target_parity, reserved_mask)
     pair_errors, pair_coords, leftover = build_pairs(coords, errors)
 
     kinds_all = [classify_pair(int(h1), int(h2)) for h1, h2 in pair_errors]
@@ -517,7 +712,8 @@ def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix
     return Image.fromarray(res.astype(np.uint8)), new_ptr, stop_rank
 
 
-def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix, stop_rank):
+def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix,
+                         stop_rank, reserved_mask=None):
     """
     Reverse only the pairs selected during embedding.
 
@@ -526,7 +722,7 @@ def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix, sto
     modified during embedding, so they must remain untouched here.
     """
     coords, stego_errors, _ = get_valid_errors_in_order(
-        stego_arr, rounded_pred, target_parity)
+        stego_arr, rounded_pred, target_parity, reserved_mask)
     pair_new, pair_coords, leftover = build_pairs(coords, stego_errors)
 
     n_pairs = len(pair_new)
@@ -592,43 +788,80 @@ def predict_target_parity(model, img_arr, target_parity, device):
 
 def embed_two_stage_2dpee(model, img_arr, full_payload, device, target_ec):
     """
-    Embed payload in checkerboard order with decoder-reproducible complexity.
+    Embed a secret payload and all reversible auxiliary information.
 
-    Boundary pixels are first adjusted from 0 to 1 and 255 to 254.  The returned
-    location map is required to restore them after extraction.  Stage 1 embeds
-    parity-1 pixels using complexity from original parity-0 pixels.  Stage 2
-    embeds parity-0 pixels using complexity from the parity-1 stego pixels
-    produced by Stage 1.
+    The location map, stop ranks, and secret payload length are written into
+    deterministic border LSBs after PEE.  The overwritten original LSBs are
+    prepended to the PEE payload and restored during extraction.
     """
     stage1_target = 1
     stage2_target = 0
     prepared_img, location_map = preprocess_boundary_pixels(img_arr)
+    secret_payload = list(full_payload if target_ec is None else full_payload[:target_ec])
+    if any(bit not in (0, 1) for bit in secret_payload):
+        raise ValueError("full_payload must contain only 0 or 1")
 
-    prediction1 = predict_target_parity(model, prepared_img, stage1_target, device)
-    complexity1 = get_cross_complexity_matrix(prepared_img, stage1_target)
+    compressed_location_map = pack_location_map(location_map)
+    placeholder_auxiliary = serialize_auxiliary_information(
+        prepared_img.shape,
+        stage1_stop_rank=0,
+        stage2_stop_rank=0,
+        payload_length=len(secret_payload),
+        compressed_location_map=compressed_location_map,
+    )
+    auxiliary_bits = bytes_to_bits(placeholder_auxiliary)
+    reserved_coords, reserved_mask = get_reserved_lsb_mask(
+        prepared_img.shape, len(auxiliary_bits))
+    original_reserved_lsbs = read_lsb_bits(prepared_img, reserved_coords)
+    pee_payload = original_reserved_lsbs + secret_payload
+
+    # Header LSB values are not stable until the stop ranks are known.  Both
+    # sides therefore clear all reserved LSBs before prediction/complexity.
+    stage1_context = clear_reserved_lsb(prepared_img, reserved_mask)
+
+    prediction1 = predict_target_parity(model, stage1_context, stage1_target, device)
+    complexity1 = get_cross_complexity_matrix(stage1_context, stage1_target)
     stego1, used1, stop_rank1 = embed_stage_2dpee(
-        prepared_img, prediction1, stage1_target, full_payload, complexity1,
-        bit_ptr_start=0, target_ec=target_ec)
+        prepared_img, prediction1, stage1_target, pee_payload, complexity1,
+        bit_ptr_start=0, target_ec=len(pee_payload), reserved_mask=reserved_mask)
     stego1_arr = np.array(stego1)
 
-    prediction2 = predict_target_parity(model, stego1_arr, stage2_target, device)
-    complexity2 = get_cross_complexity_matrix(stego1_arr, stage2_target)
+    stage2_context = clear_reserved_lsb(stego1_arr, reserved_mask)
+    prediction2 = predict_target_parity(model, stage2_context, stage2_target, device)
+    complexity2 = get_cross_complexity_matrix(stage2_context, stage2_target)
     stego2, used_total, stop_rank2 = embed_stage_2dpee(
-        stego1_arr, prediction2, stage2_target, full_payload, complexity2,
-        bit_ptr_start=used1, target_ec=target_ec)
+        stego1_arr, prediction2, stage2_target, pee_payload, complexity2,
+        bit_ptr_start=used1, target_ec=len(pee_payload), reserved_mask=reserved_mask)
+
+    if used_total != len(pee_payload):
+        raise ValueError(
+            "insufficient PEE capacity for auxiliary information and payload: "
+            f"embedded {used_total} of {len(pee_payload)} bits")
+
+    auxiliary_information = serialize_auxiliary_information(
+        prepared_img.shape,
+        stage1_stop_rank=stop_rank1,
+        stage2_stop_rank=stop_rank2,
+        payload_length=len(secret_payload),
+        compressed_location_map=compressed_location_map,
+    )
+    final_auxiliary_bits = bytes_to_bits(auxiliary_information)
+    if len(final_auxiliary_bits) != len(auxiliary_bits):
+        raise RuntimeError("auxiliary-information length changed after embedding")
+    stego_arr = write_lsb_bits(np.asarray(stego2), reserved_coords, final_auxiliary_bits)
 
     embedding_info = {
-        "payload_length": used_total,
+        "payload_length": len(secret_payload),
         "stage1_payload_length": used1,
         "stage1_stop_rank": stop_rank1,
         "stage2_stop_rank": stop_rank2,
-        "location_map": location_map,
+        "auxiliary_bit_length": len(auxiliary_bits),
     }
-    return stego2, embedding_info
+    return Image.fromarray(stego_arr), embedding_info
 
 
-def extract_two_stage_2dpee(model, stego_arr, device, stage1_stop_rank,
-                             stage2_stop_rank, payload_length=None,
+def extract_two_stage_2dpee(model, stego_arr, device, stage1_stop_rank=None,
+                             stage2_stop_rank=None, payload_length=None,
                              location_map=None):
     """
     Recover the payload and cover image in the reverse checkerboard order.
@@ -642,18 +875,60 @@ def extract_two_stage_2dpee(model, stego_arr, device, stage1_stop_rank,
     stage2_target = 0
     stego_arr = np.asarray(stego_arr)
 
-    prediction2 = predict_target_parity(model, stego_arr, stage2_target, device)
-    complexity2 = get_cross_complexity_matrix(stego_arr, stage2_target)
+    if stage1_stop_rank is None and stage2_stop_rank is None:
+        auxiliary_info = deserialize_auxiliary_information(stego_arr)
+        stage1_stop_rank = auxiliary_info["stage1_stop_rank"]
+        stage2_stop_rank = auxiliary_info["stage2_stop_rank"]
+        payload_length = auxiliary_info["payload_length"]
+        location_map = auxiliary_info["location_map"]
+        reserved_coords = auxiliary_info["reserved_coords"]
+        _, reserved_mask = get_reserved_lsb_mask(
+            stego_arr.shape, auxiliary_info["auxiliary_bit_length"])
+        reserved_lsb_count = len(reserved_coords)
+    elif stage1_stop_rank is None or stage2_stop_rank is None:
+        raise ValueError(
+            "stage1_stop_rank and stage2_stop_rank must both be provided, "
+            "or both be omitted to read embedded auxiliary information")
+    else:
+        # Compatibility path for RDH-03 callers.  RDH-04 callers should omit
+        # these values and let the decoder read the embedded header instead.
+        reserved_coords = []
+        reserved_mask = np.zeros(stego_arr.shape, dtype=bool)
+        reserved_lsb_count = 0
+
+    stage2_context = clear_reserved_lsb(stego_arr, reserved_mask)
+    prediction2 = predict_target_parity(model, stage2_context, stage2_target, device)
+    complexity2 = get_cross_complexity_matrix(stage2_context, stage2_target)
     stego1, stage2_bits = extract_stage_2dpee(
-        stego_arr, prediction2, stage2_target, complexity2, stage2_stop_rank)
+        stego_arr, prediction2, stage2_target, complexity2, stage2_stop_rank,
+        reserved_mask=reserved_mask)
     stego1_arr = np.array(stego1)
 
-    prediction1 = predict_target_parity(model, stego1_arr, stage1_target, device)
-    complexity1 = get_cross_complexity_matrix(stego1_arr, stage1_target)
+    stage1_context = clear_reserved_lsb(stego1_arr, reserved_mask)
+    prediction1 = predict_target_parity(model, stage1_context, stage1_target, device)
+    complexity1 = get_cross_complexity_matrix(stage1_context, stage1_target)
     recovered, stage1_bits = extract_stage_2dpee(
-        stego1_arr, prediction1, stage1_target, complexity1, stage1_stop_rank)
+        stego1_arr, prediction1, stage1_target, complexity1, stage1_stop_rank,
+        reserved_mask=reserved_mask)
 
-    extracted_payload = stage1_bits + stage2_bits
+    extracted_pee_payload = stage1_bits + stage2_bits
+    if reserved_lsb_count:
+        required_length = reserved_lsb_count + payload_length
+        if required_length > len(extracted_pee_payload):
+            raise ValueError(
+                "extracted PEE payload is shorter than auxiliary metadata requires: "
+                f"{len(extracted_pee_payload)} < {required_length}")
+        recovered = Image.fromarray(write_lsb_bits(
+            recovered,
+            reserved_coords,
+            extracted_pee_payload[:reserved_lsb_count],
+        ))
+        extracted_payload = extracted_pee_payload[
+            reserved_lsb_count:required_length
+        ]
+    else:
+        extracted_payload = extracted_pee_payload
+
     if payload_length is not None:
         if payload_length < 0:
             raise ValueError(f"payload_length must be non-negative, got {payload_length}")
