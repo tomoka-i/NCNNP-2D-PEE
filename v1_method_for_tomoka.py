@@ -298,6 +298,18 @@ def build_pairs(coords, errors):
     return pair_errors, pair_coords, leftover
 
 
+def get_pair_priority_order(pair_coords, comp_matrix):
+    """Return pair indices from low to high complexity with a stable tie-break."""
+    if len(pair_coords) == 0:
+        return np.array([], dtype=int)
+
+    pair_complexity = np.array([
+        (comp_matrix[c1[0], c1[1]] + comp_matrix[c2[0], c2[1]]) / 2.0
+        for c1, c2 in pair_coords
+    ])
+    return np.argsort(pair_complexity, kind='stable')
+
+
 # ============================================================
 # 6. Stage-level embed / extract
 # ============================================================
@@ -316,14 +328,7 @@ def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix
 
     # 依複雜度排序，決定embedding優先順序 (平滑的pair優先)
     n_pairs = len(pair_errors)
-    if n_pairs > 0:
-        pair_complexity = np.array([
-            (comp_matrix[c1[0], c1[1]] + comp_matrix[c2[0], c2[1]]) / 2.0
-            for c1, c2 in pair_coords
-        ])
-        priority_order = np.argsort(pair_complexity, kind='stable')
-    else:
-        priority_order = np.array([], dtype=int)
+    priority_order = get_pair_priority_order(pair_coords, comp_matrix)
 
     if target_ec is None:
         needed = float('inf')
@@ -333,17 +338,18 @@ def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix
     # Pass 1: 依複雜度優先順序累計capacity，找出達到needed所需的pair數 stop_rank
     n_A_running = 0
     n_BC_running = 0
-    stop_rank = n_pairs  # 預設全部pair都要處理
-    for rank, idx in enumerate(priority_order):
-        k = kinds_all[idx]
-        if k == 'A':
-            n_A_running += 1
-        elif k in ('B', 'C'):
-            n_BC_running += 1
-        cap_so_far = n_BC_running + ternary_capacity_bits(n_A_running)
-        if cap_so_far >= needed:
-            stop_rank = rank + 1
-            break
+    stop_rank = 0 if needed == 0 else n_pairs
+    if needed > 0:
+        for rank, idx in enumerate(priority_order):
+            k = kinds_all[idx]
+            if k == 'A':
+                n_A_running += 1
+            elif k in ('B', 'C'):
+                n_BC_running += 1
+            cap_so_far = n_BC_running + ternary_capacity_bits(n_A_running)
+            if cap_so_far >= needed:
+                stop_rank = rank + 1
+                break
 
     selected_indices = priority_order[:stop_rank]
     used_kinds = [kinds_all[i] for i in selected_indices]
@@ -398,32 +404,34 @@ def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix
     return Image.fromarray(res.astype(np.uint8)), new_ptr, stop_rank
 
 
-def extract_stage_2dpee(stego_arr, rounded_pred, target_parity):
-    h, w = stego_arr.shape
-    y_idx, x_idx = np.indices((h, w))
-    valid_mask = (y_idx + x_idx) % 2 == target_parity
-    coords = np.argwhere(valid_mask)
-    stego_errors = stego_arr.astype(np.int32)[valid_mask] - rounded_pred[valid_mask]
+def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix, stop_rank):
+    """
+    Reverse only the pairs selected during embedding.
 
-    n = len(stego_errors)
-    n_pairs = n // 2
-    leftover = None
-    if n % 2 == 1:
-        leftover = (coords[-1], stego_errors[-1])
-        stego_errors = stego_errors[:-1]
-        coords = coords[:-1]
+    The decoder must receive the same complexity matrix used by the corresponding
+    embedding stage and the stage's stop_rank.  Pairs after stop_rank were not
+    modified during embedding, so they must remain untouched here.
+    """
+    coords, stego_errors, _ = get_valid_errors_in_order(
+        stego_arr, rounded_pred, target_parity)
+    pair_new, pair_coords, leftover = build_pairs(coords, stego_errors)
 
-    pair_new = stego_errors.reshape(n_pairs, 2)
-    pair_coords = coords.reshape(n_pairs, 2, 2)
+    n_pairs = len(pair_new)
+    if not 0 <= stop_rank <= n_pairs:
+        raise ValueError(
+            f"stop_rank must be between 0 and {n_pairs}, got {stop_rank}")
+
+    priority_order = get_pair_priority_order(pair_coords, comp_matrix)
+    selected_indices = priority_order[:stop_rank]
 
     recon = stego_arr.copy().astype(np.int32)
     a_symbols, bc_bits = [], []
     n_A = 0
 
-    decoded = []
-    for (nh1, nh2), (c1, c2) in zip(pair_new, pair_coords):
+    for pidx in selected_indices:
+        nh1, nh2 = pair_new[pidx]
+        c1, c2 = pair_coords[pidx]
         h1, h2, kind, val = extract_pair(int(nh1), int(nh2))
-        decoded.append((kind, val))
         y1, x1 = c1; y2, x2 = c2
         recon[y1, x1] = np.clip(rounded_pred[y1, x1] + h1, 0, 255)
         recon[y2, x2] = np.clip(rounded_pred[y2, x2] + h2, 0, 255)
@@ -438,7 +446,8 @@ def extract_stage_2dpee(stego_arr, rounded_pred, target_parity):
 
     extracted_bits = bc_bits + a_bits
 
-    if leftover is not None:
+    # The leftover pixel is changed only when the embedder processes every pair.
+    if leftover is not None and stop_rank == n_pairs:
         (ly, lx), le_new = leftover
         e, bit = f1d_extract(int(le_new))
         recon[ly, lx] = np.clip(rounded_pred[ly, lx] + e, 0, 255)
