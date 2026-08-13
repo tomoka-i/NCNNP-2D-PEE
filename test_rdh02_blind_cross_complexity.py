@@ -119,9 +119,12 @@ class TestBlindCrossComplexity(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(recovered), self.original)
 
     def test_public_api_recovers_payload_and_cover_image(self):
+        # RDH-04 stores auxiliary information in border LSBs, so this public
+        # end-to-end test needs a border large enough to hold the header.
+        original = np.full((256, 256), 100, dtype=np.uint8)
         stego, info = embed_two_stage_2dpee(
             self.model,
-            self.original,
+            original,
             self.payload,
             self.device,
             target_ec=len(self.payload),
@@ -130,13 +133,10 @@ class TestBlindCrossComplexity(unittest.TestCase):
             self.model,
             np.asarray(stego),
             self.device,
-            info["stage1_stop_rank"],
-            info["stage2_stop_rank"],
-            info["payload_length"],
         )
 
         self.assertEqual(extracted, self.payload)
-        np.testing.assert_array_equal(np.asarray(recovered), self.original)
+        np.testing.assert_array_equal(np.asarray(recovered), original)
 
 
 if __name__ == "__main__":

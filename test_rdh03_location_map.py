@@ -48,11 +48,13 @@ class TestLocationMap(unittest.TestCase):
 
     def test_two_stage_round_trip_restores_boundary_pixels(self):
         model = ConstantPredictor().eval()
-        original = np.full((8, 8), 100, dtype=np.uint8)
+        # RDH-04 stores auxiliary information in border LSBs, so this public
+        # end-to-end test needs a border large enough to hold the header.
+        original = np.full((256, 256), 100, dtype=np.uint8)
         original[0, 0] = 0
         original[0, 1] = 255
-        original[7, 6] = 0
-        original[7, 7] = 255
+        original[255, 254] = 0
+        original[255, 255] = 255
         payload = [1, 0, 1, 1]
 
         stego, info = embed_two_stage_2dpee(
@@ -66,10 +68,6 @@ class TestLocationMap(unittest.TestCase):
             model,
             np.asarray(stego),
             "cpu",
-            info["stage1_stop_rank"],
-            info["stage2_stop_rank"],
-            info["payload_length"],
-            location_map=info["location_map"],
         )
 
         self.assertEqual(extracted, payload)
