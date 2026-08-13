@@ -119,6 +119,69 @@ def get_full_complexity_matrix(img_arr):
     return np.sqrt(np.maximum(var, 0))
 
 
+LOCATION_MAP_UNCHANGED = 0
+LOCATION_MAP_FROM_ZERO = 1
+LOCATION_MAP_FROM_255 = 2
+
+
+def preprocess_boundary_pixels(img_arr):
+    """
+    Adjust boundary pixels before PEE and record their original values.
+
+    The location map uses three symbols: unchanged, original 0, and original
+    255.  RDH-04 will compress and embed this map as auxiliary information.
+    """
+    image = np.asarray(img_arr)
+    if image.ndim != 2:
+        raise ValueError(f"img_arr must be a 2D grayscale image, got {image.ndim}D")
+    if not np.issubdtype(image.dtype, np.integer):
+        raise TypeError(f"img_arr must have an integer dtype, got {image.dtype}")
+    if np.any((image < 0) | (image > 255)):
+        raise ValueError("img_arr values must be in the range [0, 255]")
+
+    adjusted = image.astype(np.uint8, copy=True)
+    location_map = np.full(image.shape, LOCATION_MAP_UNCHANGED, dtype=np.uint8)
+
+    zero_mask = adjusted == 0
+    upper_mask = adjusted == 255
+    adjusted[zero_mask] = 1
+    adjusted[upper_mask] = 254
+    location_map[zero_mask] = LOCATION_MAP_FROM_ZERO
+    location_map[upper_mask] = LOCATION_MAP_FROM_255
+    return adjusted, location_map
+
+
+def restore_boundary_pixels(img_arr, location_map):
+    """Restore 0 and 255 pixels after both PEE stages have been reversed."""
+    image = np.asarray(img_arr)
+    location_map = np.asarray(location_map)
+    if image.shape != location_map.shape:
+        raise ValueError(
+            "img_arr and location_map must have the same shape: "
+            f"{image.shape} != {location_map.shape}")
+    if np.any(~np.isin(
+        location_map,
+        (LOCATION_MAP_UNCHANGED, LOCATION_MAP_FROM_ZERO, LOCATION_MAP_FROM_255),
+    )):
+        raise ValueError("location_map contains an unknown symbol")
+
+    restored = image.astype(np.uint8, copy=True)
+    restored[location_map == LOCATION_MAP_FROM_ZERO] = 0
+    restored[location_map == LOCATION_MAP_FROM_255] = 255
+    return restored
+
+
+def assign_predicted_pixel(res, rounded_pred, coord, error):
+    """Assign one reversible PEE result and reject an unhandled overflow."""
+    y, x = coord
+    value = int(rounded_pred[y, x]) + int(error)
+    if not 0 <= value <= 255:
+        raise OverflowError(
+            f"PEE produced out-of-range pixel {value} at ({y}, {x}); "
+            "preprocess boundary pixels before embedding")
+    res[y, x] = value
+
+
 def get_cross_complexity_matrix(img_arr, target_parity):
     """
     Compute complexity for one checkerboard target set from the opposite set.
@@ -432,8 +495,8 @@ def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix
             val = None
         nh1, nh2 = embed_pair(h1, h2, kind, val)
         y1, x1 = c1; y2, x2 = c2
-        res[y1, x1] = np.clip(rounded_pred[y1, x1] + nh1, 0, 255)
-        res[y2, x2] = np.clip(rounded_pred[y2, x2] + nh2, 0, 255)
+        assign_predicted_pixel(res, rounded_pred, (y1, x1), nh1)
+        assign_predicted_pixel(res, rounded_pred, (y2, x2), nh2)
 
     new_ptr = bit_ptr_start + used
 
@@ -449,7 +512,7 @@ def embed_stage_2dpee(img_arr, rounded_pred, target_parity, payload, comp_matrix
             new_e = f1d_embed(le, 0)
         else:
             new_e = f1d_shift(le)
-        res[ly, lx] = np.clip(rounded_pred[ly, lx] + new_e, 0, 255)
+        assign_predicted_pixel(res, rounded_pred, (ly, lx), new_e)
 
     return Image.fromarray(res.astype(np.uint8)), new_ptr, stop_rank
 
@@ -483,8 +546,8 @@ def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix, sto
         c1, c2 = pair_coords[pidx]
         h1, h2, kind, val = extract_pair(int(nh1), int(nh2))
         y1, x1 = c1; y2, x2 = c2
-        recon[y1, x1] = np.clip(rounded_pred[y1, x1] + h1, 0, 255)
-        recon[y2, x2] = np.clip(rounded_pred[y2, x2] + h2, 0, 255)
+        assign_predicted_pixel(recon, rounded_pred, (y1, x1), h1)
+        assign_predicted_pixel(recon, rounded_pred, (y2, x2), h2)
         if kind == 'A':
             a_symbols.append(val); n_A += 1
         elif kind in ('B', 'C'):
@@ -500,7 +563,7 @@ def extract_stage_2dpee(stego_arr, rounded_pred, target_parity, comp_matrix, sto
     if leftover is not None and stop_rank == n_pairs:
         (ly, lx), le_new = leftover
         e, bit = f1d_extract(int(le_new))
-        recon[ly, lx] = np.clip(rounded_pred[ly, lx] + e, 0, 255)
+        assign_predicted_pixel(recon, rounded_pred, (ly, lx), e)
         if bit is not None:
             extracted_bits = extracted_bits + [bit]
 
@@ -531,17 +594,20 @@ def embed_two_stage_2dpee(model, img_arr, full_payload, device, target_ec):
     """
     Embed payload in checkerboard order with decoder-reproducible complexity.
 
-    Stage 1 embeds parity-1 pixels using complexity from original parity-0
-    pixels.  Stage 2 embeds parity-0 pixels using complexity from the parity-1
-    stego pixels produced by Stage 1.
+    Boundary pixels are first adjusted from 0 to 1 and 255 to 254.  The returned
+    location map is required to restore them after extraction.  Stage 1 embeds
+    parity-1 pixels using complexity from original parity-0 pixels.  Stage 2
+    embeds parity-0 pixels using complexity from the parity-1 stego pixels
+    produced by Stage 1.
     """
     stage1_target = 1
     stage2_target = 0
+    prepared_img, location_map = preprocess_boundary_pixels(img_arr)
 
-    prediction1 = predict_target_parity(model, img_arr, stage1_target, device)
-    complexity1 = get_cross_complexity_matrix(img_arr, stage1_target)
+    prediction1 = predict_target_parity(model, prepared_img, stage1_target, device)
+    complexity1 = get_cross_complexity_matrix(prepared_img, stage1_target)
     stego1, used1, stop_rank1 = embed_stage_2dpee(
-        img_arr, prediction1, stage1_target, full_payload, complexity1,
+        prepared_img, prediction1, stage1_target, full_payload, complexity1,
         bit_ptr_start=0, target_ec=target_ec)
     stego1_arr = np.array(stego1)
 
@@ -556,12 +622,14 @@ def embed_two_stage_2dpee(model, img_arr, full_payload, device, target_ec):
         "stage1_payload_length": used1,
         "stage1_stop_rank": stop_rank1,
         "stage2_stop_rank": stop_rank2,
+        "location_map": location_map,
     }
     return stego2, embedding_info
 
 
 def extract_two_stage_2dpee(model, stego_arr, device, stage1_stop_rank,
-                             stage2_stop_rank, payload_length=None):
+                             stage2_stop_rank, payload_length=None,
+                             location_map=None):
     """
     Recover the payload and cover image in the reverse checkerboard order.
 
@@ -594,6 +662,9 @@ def extract_two_stage_2dpee(model, stego_arr, device, stage1_stop_rank,
                 "payload_length exceeds the number of extracted bits: "
                 f"{payload_length} > {len(extracted_payload)}")
         extracted_payload = extracted_payload[:payload_length]
+
+    if location_map is not None:
+        recovered = Image.fromarray(restore_boundary_pixels(recovered, location_map))
 
     return recovered, extracted_payload
 
