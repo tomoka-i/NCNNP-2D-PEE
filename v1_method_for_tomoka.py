@@ -16,6 +16,7 @@ import os
 import csv
 import struct
 import zlib
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -963,7 +964,10 @@ def main():
     device = pick_device()
     img_dir = "images"
     model_path = "ncnnp_imagenette.pth"
-    output_csv = "output_results_2dpee_paper_mapping.csv"
+    run_id = datetime.now().strftime("rdh05_%Y%m%d_%H%M%S_%f")
+    output_dir = os.path.join("results", run_id)
+    os.makedirs(output_dir, exist_ok=False)
+    output_csv = os.path.join(output_dir, "output_results_2dpee_paper_mapping.csv")
     EC_LIST = [10000, 20000]
 
     model = NCNNP().to(device)
@@ -994,7 +998,7 @@ def main():
                 "Image": file_name, "EC_target": ec, "Used_bits": used,
                 "PSNR": psnr, "SSIM": ssim_val, "Status": status
             })
-            stego.save(f"stego_2dpee_paper_EC{ec}_{file_name}")
+            stego.save(os.path.join(output_dir, f"stego_2dpee_paper_EC{ec}_{file_name}"))
 
     if results:
         with open(output_csv, 'w', newline='') as f:
@@ -1013,7 +1017,7 @@ def main():
                     })
                     print(f"\n[EC={ec}] Average PSNR: {avg_psnr:.2f} | Average SSIM: {avg_ssim:.4f}")
 
-        print(f"\n[Done] Saved to {output_csv}")
+        print(f"\n[Done] Saved to {output_dir}")
 
 
 if __name__ == "__main__":
